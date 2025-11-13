@@ -1,5 +1,6 @@
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use rand::Rng;
 use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::str::FromStr;
@@ -132,20 +133,31 @@ impl Card {
         )
     }
     // Trick strength ordering
-    fn compare_trick(&self, other: &Card, lead: Suit, trump: Suit) -> Ordering {
-        // (is_red_joker, is_black_joker, is_trump, follows_lead, rank_value)
-        fn key(c: &Card, lead: Suit, trump: Suit) -> (u8, u8, u8, u8, u8) {
-            let is_red = matches!(c.rank, Rank::RJoker) as u8;
-            let is_black = matches!(c.rank, Rank::BJoker) as u8;
-            let is_trump = (c.suit == trump) as u8;
-            let follows = (c.suit == lead) as u8;
-            let rankv = if c.is_joker() { 0 } else { c.rank.num_value() } as u8;
-            (is_red, is_black, is_trump, follows, rankv)
+    // Default: Black Joker > Red Joker > trump > lead-suit cards by rank > others.
+    // If "black_becomes_highest_trump" is true, Black is still highest and also leadable (handled elsewhere).
+    fn compare_trick(&self, other: &Card, lead: Suit, trump: Suit, black_highest: bool) -> Ordering {
+        fn joker_score(rank: Rank) -> u8 {
+            match rank {
+                Rank::BJoker => 2,
+                Rank::RJoker => 1,
+                _ => 0,
+            }
         }
-        key(self, lead, trump).cmp(&key(other, lead, trump))
+        fn key(c: &Card, lead: Suit, trump: Suit, _black_highest: bool) -> (u8, u8, u8, u8) {
+            // jokers outrank everything based on joker_score
+            let j = joker_score(c.rank);
+            // trump suit bonus if not a joker
+            let t = if j == 0 && c.suit == trump { 1 } else { 0 };
+            // follows lead bonus if not a joker and not trump
+            let f = if j == 0 && t == 0 && c.suit == lead { 1 } else { 0 };
+            // rank value for non-jokers; jokers get 0 here (already handled)
+            let rv = if j == 0 { c.rank.num_value() } else { 0 };
+            (j, t, f, rv)
+        }
+        key(self, lead, trump, black_highest).cmp(&key(other, lead, trump, black_highest))
     }
-    fn beats(&self, other: &Card, lead: Suit, trump: Suit) -> bool {
-        self.compare_trick(other, lead, trump) == Ordering::Greater
+    fn beats(&self, other: &Card, lead: Suit, trump: Suit, black_highest: bool) -> bool {
+        self.compare_trick(other, lead, trump, black_highest) == Ordering::Greater
     }
 }
 
@@ -155,7 +167,6 @@ impl Card {
 struct Deck {
     cards: Vec<Card>,
 }
-
 impl Deck {
     fn new_for_mode(mode: GameMode) -> Self {
         let mut cards = Vec::new();
@@ -168,8 +179,8 @@ impl Deck {
                     matches!(r, Rank::Six|Rank::Seven|Rank::Eight|Rank::Nine|Rank::Ten|Rank::Jack|Rank::Queen|Rank::King|Rank::Ace|Rank::BJoker|Rank::RJoker)
                 }
                 GameMode::Hokm6 => {
-                    // all ranks + Jokers
-                    !matches!(r, Rank::BJoker|Rank::RJoker) // add jokers later explicitly
+                    // all suited ranks; jokers added later
+                    !matches!(r, Rank::BJoker|Rank::RJoker)
                 }
                 GameMode::Baloot => {
                     // 6..Ace, NO jokers
@@ -182,19 +193,9 @@ impl Deck {
         for &suit in &[Suit::Clubs, Suit::Diamonds, Suit::Hearts, Suit::Spades] {
             for r in 2..=14 {
                 let rank = match r {
-                    2 => Rank::Two,
-                    3 => Rank::Three,
-                    4 => Rank::Four,
-                    5 => Rank::Five,
-                    6 => Rank::Six,
-                    7 => Rank::Seven,
-                    8 => Rank::Eight,
-                    9 => Rank::Nine,
-                    10 => Rank::Ten,
-                    11 => Rank::Jack,
-                    12 => Rank::Queen,
-                    13 => Rank::King,
-                    14 => Rank::Ace,
+                    2 => Rank::Two, 3 => Rank::Three, 4 => Rank::Four, 5 => Rank::Five,
+                    6 => Rank::Six, 7 => Rank::Seven, 8 => Rank::Eight, 9 => Rank::Nine,
+                    10 => Rank::Ten, 11 => Rank::Jack, 12 => Rank::Queen, 13 => Rank::King, 14 => Rank::Ace,
                     _ => unreachable!(),
                 };
                 if include_rank(rank) {
@@ -213,11 +214,7 @@ impl Deck {
 
         // Jokers as needed
         match mode {
-            GameMode::Hokm4 => {
-                cards.push(Card::new(id, Rank::BJoker, Suit::Spades)); id += 1;
-                cards.push(Card::new(id, Rank::RJoker, Suit::Hearts));
-            }
-            GameMode::Hokm6 => {
+            GameMode::Hokm4 | GameMode::Hokm6 => {
                 cards.push(Card::new(id, Rank::BJoker, Suit::Spades)); id += 1;
                 cards.push(Card::new(id, Rank::RJoker, Suit::Hearts));
             }
@@ -230,6 +227,10 @@ impl Deck {
     fn shuffle(&mut self) {
         let mut rng = thread_rng();
         self.cards.shuffle(&mut rng);
+    }
+
+    fn mark_trump(&mut self, trump: Suit) {
+        for c in &mut self.cards { c.trump = c.suit == trump; }
     }
 }
 
@@ -248,11 +249,7 @@ enum Bid {
 impl Bid {
     fn value(self) -> u8 {
         match self {
-            Bid::Five => 5,
-            Bid::Six => 6,
-            Bid::Seven => 7,
-            Bid::Eight => 8,
-            Bid::Nine => 9,
+            Bid::Five => 5, Bid::Six => 6, Bid::Seven => 7, Bid::Eight => 8, Bid::Nine => 9,
             Bid::Pass | Bid::Reshuffle => 0,
         }
     }
@@ -270,13 +267,8 @@ impl Bid {
     }
     fn label(self) -> &'static str {
         match self {
-            Bid::Pass => "pass",
-            Bid::Five => "5",
-            Bid::Six => "6",
-            Bid::Seven => "7",
-            Bid::Eight => "8",
-            Bid::Nine => "9",
-            Bid::Reshuffle => "reshuffle",
+            Bid::Pass => "pass", Bid::Five => "5", Bid::Six => "6", Bid::Seven => "7",
+            Bid::Eight => "8", Bid::Nine => "9", Bid::Reshuffle => "reshuffle",
         }
     }
 }
@@ -307,17 +299,16 @@ struct Game {
     deck: Deck,
     players: Vec<Player>,
     dealer: usize,     // 0..num_players-1
-    trump: Suit,
+    trump: Option<Suit>,
     scores: [u32; 2],  // team0: even seats, team1: odd seats
-    trick_no: usize,   // 1..=9
+    // per-hand state
     red_played: bool,
     black_played: bool,
-    black_holder_team: Option<usize>,
-    black_becomes_highest_trump: bool,
+    black_becomes_highest_trump: bool, // set if red legitimately played before black under exception
 }
 
 impl Game {
-    fn new(mode: GameMode, dealer: usize, trump: Suit) -> Self {
+    fn new(mode: GameMode, dealer: usize) -> Self {
         let num_players = match mode {
             GameMode::Hokm4 | GameMode::Baloot => 4,
             GameMode::Hokm6 => 6,
@@ -334,33 +325,37 @@ impl Game {
             deck,
             players,
             dealer: dealer % num_players,
-            trump,
+            trump: None,
             scores: [0, 0],
-            trick_no: 0,
             red_played: false,
             black_played: false,
-            black_holder_team: None,
             black_becomes_highest_trump: false,
         }
     }
 
-    fn team_of(&self, player: usize) -> usize { player % 2 } // even indices team0, odd team1
-    fn team_name(team: usize) -> &'static str {
-        match team {
-            0 => "Team 0",
-            1 => "Team 1",
-            _ => "Unknown",
+    fn reset_hand_state(&mut self) {
+        self.trump = None;
+        self.red_played = false;
+        self.black_played = false;
+        self.black_becomes_highest_trump = false;
+        self.deck = Deck::new_for_mode(self.mode);
+        self.deck.shuffle();
+        for p in &mut self.players {
+            p.hand.clear();
         }
+    }
+
+    fn team_of(&self, player: usize) -> usize { player % 2 }
+    fn team_name(team: usize) -> &'static str {
+        match team { 0 => "Team 0", 1 => "Team 1", _ => "Unknown" }
     }
 
     /// Deal anticlockwise in 3-card packets starting to the right of dealer and ending on dealer, until HAND_SIZE.
     fn deal(&mut self) {
-        // Build anticlockwise order: right of dealer first, wrap around, dealer last
         let mut order = Vec::with_capacity(self.num_players);
         for i in 1..=self.num_players {
             order.push((self.dealer + i) % self.num_players);
         }
-
         for _round in 0..(HAND_SIZE / 3) {
             for &p in &order {
                 for _ in 0..3 {
@@ -369,224 +364,109 @@ impl Game {
                 }
             }
         }
-
-        // Track black-joker holder team (if a joker exists in this mode)
-        let holder = self.players.iter().position(|pl| pl.has_black_joker());
-        self.black_holder_team = holder.map(|idx| self.team_of(idx));
     }
 
-    /// Ask for a bid; must be strictly higher than current_highest (or pass).
-    /// Dealer can bid 5 only if there is no current_highest (i.e., first bid).
-    /// 8/9 require the bidder to hold ≥1 joker.
-    /// In Hokm (4p) only: if bid == 8 and the opposite teammate has a joker, auto-upgrade to 9.
-    fn prompt_bid(
-        &self,
-        player_idx: usize,
-        dealer_turn: bool,
-        allowed_reshuffle: bool,
-        current_highest: Option<Bid>,
-    ) -> Bid {
-        // Opposite teammate only meaningful in 4p Hokm
-        let teammate_has_joker = if matches!(self.mode, GameMode::Hokm4) {
-            let teammate_idx = (player_idx + (self.num_players / 2)) % self.num_players; // opposite seat
-            self.players[teammate_idx].has_joker()
-        } else {
-            false
-        };
-
-        loop {
-            print!("Player {} bid (", player_idx);
-            if dealer_turn { print!("5/"); }
-            print!("6/7/8/9/pass");
-            if allowed_reshuffle && dealer_turn { print!("/reshuffle"); }
-            if let Some(h) = current_highest { print!(")  [current highest: {}] : ", h.label()); }
-            else { print!("): "); }
-            io::stdout().flush().ok();
-
-            let mut s = String::new();
-            if io::stdin().read_line(&mut s).is_err() { continue; }
-            let mut bid = match Bid::from_input(&s) {
-                Some(b) => b,
-                None => { eprintln!("Invalid input."); continue; }
-            };
-
-            // Availability
-            if bid == Bid::Reshuffle && !(dealer_turn && allowed_reshuffle) {
-                eprintln!("Reshuffle is only available to dealer when all players passed.");
-                continue;
+    fn set_trump(&mut self, suit: Suit) {
+        self.trump = Some(suit);
+        for pl in &mut self.players {
+            for c in &mut pl.hand {
+                c.trump = c.suit == suit;
             }
-            if bid == Bid::Five && !dealer_turn {
-                eprintln!("Only dealer can pick 5.");
-                continue;
-            }
-            if (bid == Bid::Eight || bid == Bid::Nine) && !self.players[player_idx].has_joker() {
-                eprintln!("To bid 8 or 9, you must hold at least one joker.");
-                continue;
-            }
-
-            // Auto-upgrade 8 -> 9 only in Hokm(4p) if opposite teammate has a joker
-            if matches!(self.mode, GameMode::Hokm4) && bid == Bid::Eight && teammate_has_joker {
-                println!("Opposite teammate has a joker — upgrading bid from 8 to 9.");
-                bid = Bid::Nine;
-            }
-
-            // Progressive rule: must outbid current highest (or pass)
-            if let Some(high) = current_highest {
-                if bid == Bid::Pass { return Bid::Pass; }
-                if bid.value() <= high.value() {
-                    eprintln!("You must bid higher than {} or pass.", high.label());
-                    continue;
-                }
-            } else {
-                // First bid of the round
-                if bid == Bid::Pass { return Bid::Pass; }
-            }
-
-            return bid;
         }
     }
 
-    /// Progressive single-round bidding in anticlockwise order: right of dealer ... dealer.
-    /// If all pass, dealer may choose 5/6/7/8/9/pass/reshuffle (reshuffle gives +1 to enemy team and aborts hand).
-    fn bidding_phase(&mut self) -> Option<(usize, Bid)> {
-        // order of players to ask
-        let mut order = Vec::with_capacity(self.num_players);
-        for i in 1..=self.num_players {
-            order.push((self.dealer + i) % self.num_players);
-        }
-
-        let mut current_highest: Option<(usize, Bid)> = None;
-        for &p in &order {
-            let dealer_turn = p == self.dealer;
-            let bid = self.prompt_bid(p, dealer_turn, false, current_highest.map(|(_, b)| b));
-            if bid != Bid::Pass {
-                match current_highest {
-                    None => current_highest = Some((p, bid)),
-                    Some((_, h)) if bid.value() > h.value() => current_highest = Some((p, bid)),
-                    _ => { /* guarded by prompt */ }
-                }
-            }
-        }
-
-        if current_highest.is_none() {
-            // Everyone passed: dealer special menu
-            println!("All players passed. Dealer may choose 5/6/7/8/9/pass/reshuffle");
-            let bid = self.prompt_bid(self.dealer, true, true, None);
-            return match bid {
-                Bid::Reshuffle => {
-                    let enemy = 1 - self.team_of(self.dealer);
-                    self.scores[enemy] = self.scores[enemy].saturating_add(1);
-                    println!("Dealer reshuffled. +1 point to {}.", Self::team_name(enemy));
-                    None
-                }
-                Bid::Pass => {
-                    println!("Dealer passed after all-pass — round aborted.");
-                    None
-                }
-                _ => Some((self.dealer, bid)),
-            };
-        }
-
-        current_highest
-    }
-
-    /* ===== Joker validations & scoring hooks (as before) ===== */
+    /* ===== Trick play validations (updated joker rules) ===== */
 
     fn validate_play(
         &self,
-        _player_idx: usize,
-        card: &Card,
+        player_idx: usize,
+        chosen: &Card,
         lead_card_opt: Option<&Card>,
         bidder: usize,
         bidder_bid: Bid,
+        trick_no: usize,
     ) -> Result<(), String> {
-        // Cannot lead jokers
-        if lead_card_opt.is_none() && card.is_joker() {
-            return Err("Jokers cannot be led as first card of a trick.".into());
-        }
-        // Red cannot precede Black unless bidder >=7 and holds both jokers
-        if matches!(card.rank, Rank::RJoker) && !self.black_played {
-            if bidder_bid.value() >= 7 {
-                let bidder_has_both =
-                    self.players[bidder].has_black_joker() && self.players[bidder].has_red_joker();
-                if bidder_has_both { return Ok(()); }
+        // Jokers can be played ANYTIME (even if player can follow suit or trump was led),
+        // but Red-before-Black has constraints.
+        if chosen.is_joker() {
+            // Red before Black: allowed only if bidder >= 7, bidder holds BOTH jokers, and within first 3 tricks
+            if matches!(chosen.rank, Rank::RJoker) && !self.black_played {
+                if bidder_bid.value() >= 7
+                    && self.players[bidder].has_black_joker()
+                    && self.players[bidder].has_red_joker()
+                    && trick_no <= 3
+                {
+                    return Ok(());
+                } else {
+                    return Err("Red Joker cannot be played before Black Joker unless the bidder (≥7) holds both jokers, and it must be within the first 3 tricks.".into());
+                }
             }
-            return Err("Red Joker cannot be played before Black Joker (unless bidder ≥7 and holds both).".into());
+            // Black Joker can be played anytime
+            return Ok(());
         }
+
+        // Non-jokers: must follow suit if possible
+        if let Some(lead_card) = lead_card_opt {
+            let lead_suit = lead_card.suit;
+            let has_lead = self.players[player_idx]
+                .hand
+                .iter()
+                .any(|c| !c.is_joker() && c.suit == lead_suit);
+            if has_lead && chosen.suit != lead_suit {
+                return Err(format!("You must follow suit: {:?}", lead_suit));
+            }
+        }
+
         Ok(())
     }
 
-    fn apply_red_before_black_exception(&mut self) {
-        self.black_becomes_highest_trump = true;
-    }
-
-    fn on_card_played(&mut self, card: &Card, _team_of_player: usize) {
+    fn on_card_played(&mut self, player_idx: usize, card: &Card, bidder: usize, bidder_bid: Bid, trick_no: usize) {
         if matches!(card.rank, Rank::BJoker) { self.black_played = true; }
-        if matches!(card.rank, Rank::RJoker) { self.red_played = true; }
-    }
-
-    fn apply_scoring(
-        &mut self,
-        bidder: usize,
-        bid: Bid,
-        bidder_tricks_won: u8,
-        bound_called: bool,
-        bound_success: bool,
-        black_played_by_round3: bool,
-        red_forced_first_last_card: bool,
-        winners_of_hand_team: usize,
-    ) {
-        let bidder_team = self.team_of(bidder);
-        let opp_team = 1 - bidder_team;
-
-        if !black_played_by_round3 {
-            self.scores[winners_of_hand_team] =
-                self.scores[winners_of_hand_team].saturating_add(15);
-            println!("Penalty: Black Joker not played in first 3 tricks -> +15 to {}.", Self::team_name(winners_of_hand_team));
-        }
-        if red_forced_first_last_card {
-            self.scores[opp_team] = self.scores[opp_team].saturating_add(15);
-            println!("Penalty: Red Joker forced to lead as last card -> +15 to {}.", Self::team_name(opp_team));
-        }
-
-        if bound_called {
-            if bound_success {
-                self.scores[self.team_of(bidder)] = MAX_SCORE;
-                println!("Bound success! {} now at {}", Self::team_name(self.team_of(bidder)), self.scores[self.team_of(bidder)]);
-                return;
-            } else {
-                self.scores[opp_team] = self.scores[opp_team].saturating_add(18);
-                println!("Bound failed. {} +18 to {}", Self::team_name(opp_team), self.scores[opp_team]);
-                return;
+        if matches!(card.rank, Rank::RJoker) {
+            let allow_exception = bidder_bid.value() >= 7
+                && self.players[bidder].has_black_joker()
+                && self.players[bidder].has_red_joker()
+                && trick_no <= 3;
+            // If Red legitimately played before Black, then Black becomes leadable/highest trump (flag)
+            if allow_exception && !self.black_played {
+                self.black_becomes_highest_trump = true;
             }
+            self.red_played = true;
         }
 
-        let x = bid.value();
-        if x >= 5 {
-            if bidder_tricks_won >= x {
-                self.scores[bidder_team] = self.scores[bidder_team].saturating_add(x as u32);
-                println!("{} made {} -> +{}", Self::team_name(bidder_team), x, x);
-            } else {
-                self.scores[opp_team] = self.scores[opp_team].saturating_add((2 * x) as u32);
-                println!("{} failed {} -> {} +{}", Self::team_name(bidder_team), x, Self::team_name(opp_team), 2 * x);
-            }
-        }
-
-        for t in 0..2 {
-            if self.scores[t] > MAX_SCORE { self.scores[t] = MAX_SCORE; }
-        }
-        if (self.scores[0] == MERCY_SCORE && self.scores[1] == 0) ||
-           (self.scores[1] == MERCY_SCORE && self.scores[0] == 0) {
-            println!("Mercy rule: {}–0 @32 -> game ends.", MERCY_SCORE);
+        // Remove the played card from player's hand
+        if let Some(pos) = self.players[player_idx]
+            .hand
+            .iter()
+            .position(|c| c.id == card.id)
+        {
+            self.players[player_idx].hand.remove(pos);
         }
     }
 }
 
-/* ============================ utils ============================ */
+/* ============================ helpers / I/O ============================ */
 
-fn read_trump_from_user() -> Suit {
+fn suit_order(s: Suit) -> u8 {
+    match s { Suit::Clubs => 0, Suit::Diamonds => 1, Suit::Hearts => 2, Suit::Spades => 3 }
+}
+fn sort_hand(hand: &mut Vec<Card>) {
+    // Jokers first, then by suit (C,D,H,S), then by rank (low..high)
+    hand.sort_by(|a, b| {
+        let aj = a.is_joker() as u8;
+        let bj = b.is_joker() as u8;
+        bj.cmp(&aj)
+            .then(suit_order(a.suit).cmp(&suit_order(b.suit)))
+            .then(a.rank.num_value().cmp(&b.rank.num_value()))
+    });
+}
+fn joker_count(hand: &Vec<Card>) -> usize {
+    hand.iter().filter(|c| c.is_joker()).count()
+}
+
+fn read_trump_from_user(who: usize) -> Suit {
     loop {
-        print!("Choose trump (Clubs/Diamonds/Hearts/Spades): ");
+        print!("Player {}: choose trump (Clubs/Diamonds/Hearts/Spades): ", who);
         io::stdout().flush().ok();
         let mut input = String::new();
         if io::stdin().read_line(&mut input).is_ok() {
@@ -612,7 +492,330 @@ fn read_usize(prompt: &str) -> usize {
     }
 }
 
-/* ============================ demo main ============================ */
+fn choose_card_from_hand(
+    game: &Game,
+    player_idx: usize,
+    lead_card: Option<&Card>,
+    bidder: usize,
+    bidder_bid: Bid,
+    trick_no: usize,
+) -> Card {
+    loop {
+        // show hand
+        let mut hand = game.players[player_idx].hand.clone();
+        sort_hand(&mut hand);
+        println!("Player {} [{}] hand:", player_idx, Game::team_name(game.team_of(player_idx)));
+        for (i, c) in hand.iter().enumerate() {
+            println!("  {}: {}", i, c.describe());
+        }
+        let idx = read_usize("Pick a card index: ");
+
+        if idx >= hand.len() {
+            eprintln!("Out of range.");
+            continue;
+        }
+        let card = hand[idx].clone();
+
+        // Find real card in current (unsorted) hand by id
+        let real_pos = game.players[player_idx]
+            .hand
+            .iter()
+            .position(|c| c.id == card.id);
+        if real_pos.is_none() {
+            eprintln!("Selection error, try again.");
+            continue;
+        }
+
+        // Validate rules
+        if let Err(msg) = game.validate_play(player_idx, &card, lead_card, bidder, bidder_bid, trick_no) {
+            eprintln!("{}", msg);
+            continue;
+        }
+
+        return card;
+    }
+}
+
+fn show_ground(plays: &[(usize, Card)]) {
+    if plays.is_empty() {
+        println!("cards on ground: (none)");
+    } else {
+        let s = plays
+            .iter()
+            .map(|(_, c)| c.describe())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("cards on ground:\n{}", s);
+    }
+}
+
+/* ============================ bidding ============================ */
+
+impl Game {
+    /// Progressive bidding in anticlockwise order (right of dealer → … → dealer).
+    /// If the first (num_players-1) all pass, dealer gets the extended menu once.
+    fn prompt_bid(
+        &self,
+        player_idx: usize,
+        dealer_turn: bool,
+        allow_reshuffle: bool,
+        current_highest: Option<Bid>,
+    ) -> Bid {
+        let opposite_has_joker = if matches!(self.mode, GameMode::Hokm4) {
+            let opp = (player_idx + (self.num_players / 2)) % self.num_players;
+            self.players[opp].has_joker()
+        } else { false };
+
+        loop {
+            print!("Player {} bid (", player_idx);
+            if dealer_turn { print!("5/"); }
+            print!("6/7/8/9/pass");
+            if allow_reshuffle && dealer_turn { print!("/reshuffle"); }
+            if let Some(h) = current_highest { print!(")  [current highest: {}] : ", h.label()); }
+            else { print!("): "); }
+            io::stdout().flush().ok();
+
+            let mut s = String::new();
+            if io::stdin().read_line(&mut s).is_err() { continue; }
+            let mut bid = match Bid::from_input(&s) {
+                Some(b) => b,
+                None => { eprintln!("Invalid input."); continue; }
+            };
+
+            // Availability
+            if bid == Bid::Reshuffle && !(dealer_turn && allow_reshuffle) {
+                eprintln!("Reshuffle is only available to dealer when all players passed.");
+                continue;
+            }
+            if bid == Bid::Five && !dealer_turn {
+                eprintln!("Only dealer can pick 5.");
+                continue;
+            }
+            if matches!(self.mode, GameMode::Hokm4 | GameMode::Hokm6) &&
+               (bid == Bid::Eight || bid == Bid::Nine) &&
+               !self.players[player_idx].has_joker()
+            {
+                eprintln!("To bid 8 or 9 in Hokm, you must hold at least one joker.");
+                continue;
+            }
+
+            // Auto-upgrade 8 -> 9 only in Hokm(4p) if opposite teammate has a joker
+            if matches!(self.mode, GameMode::Hokm4) && bid == Bid::Eight && opposite_has_joker {
+                println!("Opposite teammate has a joker — upgrading bid from 8 to 9.");
+                bid = Bid::Nine;
+            }
+
+            // Progressive: must outbid current highest (or pass)
+            if let Some(high) = current_highest {
+                if bid == Bid::Pass { return Bid::Pass; }
+                if bid.value() <= high.value() {
+                    eprintln!("You must bid higher than {} or pass.", high.label());
+                    continue;
+                }
+            } else {
+                if bid == Bid::Pass { return Bid::Pass; }
+            }
+
+            return bid;
+        }
+    }
+
+    fn bidding_phase(&mut self) -> Option<(usize, Bid)> {
+        let mut order = Vec::with_capacity(self.num_players);
+        for i in 1..=self.num_players {
+            order.push((self.dealer + i) % self.num_players);
+        }
+
+        let mut current_highest: Option<(usize, Bid)> = None;
+
+        for (turn_i, &p) in order.iter().enumerate() {
+            let dealer_turn = p == self.dealer;
+            let allow_reshuffle_now =
+                dealer_turn && current_highest.is_none() && turn_i == order.len() - 1;
+
+            let bid = self.prompt_bid(p, dealer_turn, allow_reshuffle_now, current_highest.map(|(_, b)| b));
+
+            if bid == Bid::Reshuffle {
+                let enemy = 1 - self.team_of(self.dealer);
+                self.scores[enemy] = self.scores[enemy].saturating_add(1);
+                println!("Dealer reshuffled. +1 point to {}.", Self::team_name(enemy));
+                return None;
+            }
+            if bid == Bid::Pass {
+                if allow_reshuffle_now {
+                    println!("Dealer passed after all-pass — hand aborted.");
+                    return None;
+                }
+                continue;
+            }
+
+            match current_highest {
+                None => current_highest = Some((p, bid)),
+                Some((_, h)) if bid.value() > h.value() => current_highest = Some((p, bid)),
+                _ => {}
+            }
+        }
+
+        current_highest
+    }
+}
+
+/* ============================ one hand (deal->bid->tricks->score) ============================ */
+
+fn play_one_hand(game: &mut Game) {
+    // Deal & show hands
+    game.deal();
+
+    println!("\nHands dealt anti-clockwise (3x3 -> 9 each). Dealer = Player {}.", game.dealer);
+    for p in 0..game.num_players {
+        sort_hand(&mut game.players[p].hand);
+        let j = joker_count(&game.players[p].hand);
+        println!(
+            "Player {} [{}] ({} cards, {} joker{}):",
+            p,
+            Game::team_name(game.team_of(p)),
+            game.players[p].hand.len(),
+            j,
+            if j == 1 { "" } else { "s" }
+        );
+        for c in &game.players[p].hand {
+            println!("  {}", c.describe());
+        }
+    }
+
+    /* ------------------ BIDDING ------------------ */
+    let Some((bidder, bid)) = game.bidding_phase() else {
+        println!(
+            "Hand aborted. Scores: Team0={} Team1={}",
+            game.scores[0], game.scores[1]
+        );
+        return;
+    };
+    println!(
+        "Bid winner: Player {} ({}) -> {}",
+        bidder,
+        Game::team_name(game.team_of(bidder)),
+        bid.label()
+    );
+
+    /* ------------------ TRUMP (chosen by bid winner) ------------------ */
+    let trump = read_trump_from_user(bidder);
+    game.set_trump(trump);
+    game.deck.mark_trump(trump);
+    println!("\nTrump is {:?}.", trump);
+
+    /* ------------------ PLAY 9 TRICKS ------------------ */
+    // Leader is the player to the RIGHT (anticlockwise next) of the trump-chooser
+    let mut leader = (bidder + 1) % game.num_players;
+
+    let mut tricks_won = [0u8, 0u8];
+    let mut black_played_by_round3 = false;
+
+    for trick_no in 1..=9 {
+        println!("\n=== Trick {}/9 ===", trick_no);
+
+        let mut order = Vec::with_capacity(game.num_players);
+        for i in 0..game.num_players {
+            order.push((leader + i) % game.num_players);
+        }
+
+        let mut lead_card: Option<Card> = None;
+        let mut plays: Vec<(usize, Card)> = Vec::with_capacity(game.num_players);
+
+        for &p in &order {
+            println!("\nTurn: Player {} [{}]", p, Game::team_name(game.team_of(p)));
+
+            // Show what's already on the table BEFORE this player acts
+            show_ground(&plays);
+
+            let chosen = choose_card_from_hand(&game, p, lead_card.as_ref(), bidder, bid, trick_no);
+            game.on_card_played(p, &chosen, bidder, bid, trick_no);
+
+            // Announce the play immediately so the next player sees it in the ground list
+            println!("Player {} played {}", p, chosen.describe());
+
+            if lead_card.is_none() {
+                lead_card = Some(chosen.clone());
+            }
+            plays.push((p, chosen));
+        }
+
+        if trick_no == 3 && game.black_played {
+            black_played_by_round3 = true;
+        }
+
+        // Decide winner of the trick
+        let lead_suit = plays[0].1.suit;
+        let trump_suit = game.trump.expect("trump set");
+        let mut win_idx = 0usize;
+        for i in 1..plays.len() {
+            if plays[i].1.beats(&plays[win_idx].1, lead_suit, trump_suit, game.black_becomes_highest_trump) {
+                win_idx = i;
+            }
+        }
+        let winner_player = plays[win_idx].0;
+        let winner_team = game.team_of(winner_player);
+        tricks_won[winner_team] += 1;
+
+        // SHOW whole trick after completion
+        println!("\nPlayed this trick (leader first):");
+        for (p, c) in &plays {
+            println!("  Player {} ({}): {}", p, Game::team_name(game.team_of(*p)), c.describe());
+        }
+
+        println!(
+            "\nTrick winner: Player {} ({}) with {}",
+            winner_player,
+            Game::team_name(winner_team),
+            plays[win_idx].1.describe()
+        );
+        println!(
+            "Tricks so far — Team 0: {} | Team 1: {}",
+            tricks_won[0], tricks_won[1]
+        );
+
+        // Next trick leader is the winner
+        leader = winner_player;
+    }
+
+    /* ------------------ SCORING & PENALTIES ------------------ */
+    let hand_winner_team = if tricks_won[0] > tricks_won[1] { 0 } else { 1 };
+    let bidder_team = game.team_of(bidder);
+    let bidder_tricks = tricks_won[bidder_team];
+    let x = bid.value();
+
+    // Penalty if Black Joker not played within first 3 tricks
+    if !black_played_by_round3 {
+        game.scores[hand_winner_team] =
+            game.scores[hand_winner_team].saturating_add(15);
+        println!("Penalty: Black Joker not played by end of trick 3 -> +15 to {}.", Game::team_name(hand_winner_team));
+    }
+
+    // Main scoring (meet bid)
+    if bidder_tricks >= x as u8 {
+        game.scores[bidder_team] = game.scores[bidder_team].saturating_add(x as u32);
+        println!("{} met the bid {} -> +{}", Game::team_name(bidder_team), x, x);
+    } else {
+        let opp = 1 - bidder_team;
+        game.scores[opp] = game.scores[opp].saturating_add((2 * x) as u32);
+        println!("{} failed the bid {} -> {} +{}", Game::team_name(bidder_team), x, Game::team_name(opp), 2 * x);
+    }
+
+    for t in 0..2 {
+        if game.scores[t] > MAX_SCORE { game.scores[t] = MAX_SCORE; }
+    }
+
+    println!(
+        "\nFINAL TRICK TALLY — Team 0: {} | Team 1: {}",
+        tricks_won[0], tricks_won[1]
+    );
+    println!(
+        "SCORES — Team 0: {} | Team 1: {}",
+        game.scores[0], game.scores[1]
+    );
+}
+
+/* ============================ full match loop with dealer rotation ============================ */
 
 fn main() {
     let mode = read_mode();
@@ -621,16 +824,14 @@ fn main() {
         GameMode::Hokm6 => 6,
     };
 
-    let dealer = 0; // rotate each hand in a real loop
-    let trump = read_trump_from_user();
+    // Randomize dealer for the FIRST hand only
+    let mut dealer = thread_rng().gen_range(0..num_players);
 
-    let mut game = Game::new(mode, dealer, trump);
-    game.deal();
+    let mut game = Game::new(mode, dealer);
 
-    // Teams
     println!(
-        "\nMode: {:?} | Players: {} | Dealer: {} | Trump: {:?}",
-        game.mode, game.num_players, game.dealer, game.trump
+        "\nMode: {:?} | Players: {}",
+        game.mode, game.num_players
     );
     match game.num_players {
         4 => println!("Teams: Team 0 = Players 0 & 2 | Team 1 = Players 1 & 3"),
@@ -638,73 +839,38 @@ fn main() {
         _ => {}
     }
 
-    // Hand sizes + joker info
-    println!("\nHands dealt anti-clockwise (3x3 -> 9 each).");
-    for p in 0..num_players {
-        println!(
-            "Player {} [{}] ({} cards){}",
-            p,
-            Game::team_name(game.team_of(p)),
-            game.players[p].hand.len(),
-            if game.players[p].has_joker() { " [has joker]" } else { "" }
-        );
-    }
+    loop {
+        println!("\n================ HAND START (Dealer = Player {}) ================", dealer);
 
-    // Progressive bidding
-    let Some((bidder, bid)) = game.bidding_phase() else {
-        println!("Round ended due to all-pass w/ dealer decision. Scores: Team0={} Team1={}", game.scores[0], game.scores[1]);
-        return;
-    };
-    println!("Bid winner: Player {} ({}) -> {}", bidder, Game::team_name(game.team_of(bidder)), bid.label());
+        // Reset per-hand state & use current dealer
+        game.dealer = dealer;
+        game.reset_hand_state();
 
-    // If bidder >=7 and holds both jokers, the red-before-black exception can apply during play.
-    if bid.value() >= 7 && game.players[bidder].has_black_joker() && game.players[bidder].has_red_joker() {
-        println!("Bidder holds both jokers and bid ≥7: red-before-black exception can apply during play.");
-    }
+        // Play a hand
+        play_one_hand(&mut game);
 
-    // ---- Trick loop is still a stub; prompt results to exercise scoring ----
-    let bidder_tricks_won = read_usize("\nEnter bidder team tricks won (0..=9): ") as u8;
+        // End conditions
+        if game.scores[0] >= MAX_SCORE || game.scores[1] >= MAX_SCORE {
+            println!("\nGAME OVER — Final Scores: Team 0: {} | Team 1: {}", game.scores[0], game.scores[1]);
+            break;
+        }
+        if (game.scores[0] == MERCY_SCORE && game.scores[1] == 0) ||
+           (game.scores[1] == MERCY_SCORE && game.scores[0] == 0) {
+            println!("\nGAME OVER (Mercy) — Final Scores: Team 0: {} | Team 1: {}", game.scores[0], game.scores[1]);
+            break;
+        }
 
-    let mut bound_called = false;
-    let mut bound_success = false;
-    if bid == Bid::Seven {
-        println!("Did bidder call 'bound' with 3 rounds left? (y/n)");
-        let mut s = String::new();
-        io::stdin().read_line(&mut s).ok();
-        bound_called = s.trim().eq_ignore_ascii_case("y");
-        if bound_called {
-            println!("Did 'bound' succeed (won all remaining)? (y/n)");
-            s.clear();
-            io::stdin().read_line(&mut s).ok();
-            bound_success = s.trim().eq_ignore_ascii_case("y");
+        // Dealer rotation rules based on TOTAL scores:
+        // If the dealer's team now leads in total points, dealer moves to the right (anticlockwise).
+        // Otherwise the same player remains the dealer.
+        let dealer_team = game.team_of(dealer);
+        let other_team = 1 - dealer_team;
+        if game.scores[dealer_team] > game.scores[other_team] {
+            dealer = (dealer + 1) % num_players; // move right (anticlockwise)
+            println!("Dealer’s team leads. Dealer moves to Player {} (to the right).", dealer);
+        } else {
+            println!("Dealer’s team does not lead. Dealer stays Player {}.", dealer);
         }
     }
-
-    println!("Was Black Joker played by end of trick 3? (y/n)");
-    let mut s = String::new();
-    io::stdin().read_line(&mut s).ok();
-    let black_by3 = s.trim().eq_ignore_ascii_case("y");
-
-    println!("Was Red Joker forced to be led as the last card? (y/n)");
-    s.clear();
-    io::stdin().read_line(&mut s).ok();
-    let red_forced_first_last = s.trim().eq_ignore_ascii_case("y");
-
-    println!("Which team won the hand (0 or 1)?");
-    s.clear();
-    io::stdin().read_line(&mut s).ok();
-    let winners_team = s.trim().parse::<usize>().unwrap_or(0).min(1);
-
-    game.apply_scoring(
-        bidder,
-        bid,
-        bidder_tricks_won,
-        bound_called,
-        bound_success,
-        black_by3,
-        red_forced_first_last,
-        winners_team,
-    );
-
-    println!("\nScores now: Team0 = {}, Team1 = {}", game.scores[0], game.scores[1]);
 }
+

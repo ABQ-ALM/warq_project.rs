@@ -132,10 +132,8 @@ impl Card {
             if self.trump { " (Trump)" } else { "" }
         )
     }
-    // Trick strength ordering
-    // Default: Black Joker > Red Joker > trump > lead-suit cards by rank > others.
-    // If "black_becomes_highest_trump" is true, Black is still highest and also leadable (handled elsewhere).
-    fn compare_trick(&self, other: &Card, lead: Suit, trump: Suit, black_highest: bool) -> Ordering {
+    // Black Joker > Red Joker > trump > lead-suit by rank > others.
+    fn compare_trick(&self, other: &Card, lead: Suit, trump: Suit, _black_highest: bool) -> Ordering {
         fn joker_score(rank: Rank) -> u8 {
             match rank {
                 Rank::BJoker => 2,
@@ -143,18 +141,14 @@ impl Card {
                 _ => 0,
             }
         }
-        fn key(c: &Card, lead: Suit, trump: Suit, _black_highest: bool) -> (u8, u8, u8, u8) {
-            // jokers outrank everything based on joker_score
+        fn key(c: &Card, lead: Suit, trump: Suit) -> (u8, u8, u8, u8) {
             let j = joker_score(c.rank);
-            // trump suit bonus if not a joker
             let t = if j == 0 && c.suit == trump { 1 } else { 0 };
-            // follows lead bonus if not a joker and not trump
             let f = if j == 0 && t == 0 && c.suit == lead { 1 } else { 0 };
-            // rank value for non-jokers; jokers get 0 here (already handled)
             let rv = if j == 0 { c.rank.num_value() } else { 0 };
             (j, t, f, rv)
         }
-        key(self, lead, trump, black_highest).cmp(&key(other, lead, trump, black_highest))
+        key(self, lead, trump).cmp(&key(other, lead, trump))
     }
     fn beats(&self, other: &Card, lead: Suit, trump: Suit, black_highest: bool) -> bool {
         self.compare_trick(other, lead, trump, black_highest) == Ordering::Greater
@@ -175,7 +169,7 @@ impl Deck {
         let include_rank = |r: Rank| -> bool {
             match mode {
                 GameMode::Hokm4 => {
-                    // only 6..Ace + Jokers
+                    // 6..Ace + Jokers
                     matches!(r, Rank::Six|Rank::Seven|Rank::Eight|Rank::Nine|Rank::Ten|Rank::Jack|Rank::Queen|Rank::King|Rank::Ace|Rank::BJoker|Rank::RJoker)
                 }
                 GameMode::Hokm6 => {
@@ -199,7 +193,7 @@ impl Deck {
                     _ => unreachable!(),
                 };
                 if include_rank(rank) {
-                    // Extra exclusions for Hokm (4p): remove 6♦ and 6♣
+                    // Hokm(4): remove 6♦ and 6♣
                     if matches!(mode, GameMode::Hokm4)
                         && rank == Rank::Six
                         && (suit == Suit::Diamonds || suit == Suit::Clubs)
@@ -304,7 +298,7 @@ struct Game {
     // per-hand state
     red_played: bool,
     black_played: bool,
-    black_becomes_highest_trump: bool, // set if red legitimately played before black under exception
+    black_becomes_highest_trump: bool, // reserved for future tweak
 }
 
 impl Game {
@@ -375,7 +369,7 @@ impl Game {
         }
     }
 
-    /* ===== Trick play validations (updated joker rules) ===== */
+    /* ===== Trick play validations (joker rules) ===== */
 
     fn validate_play(
         &self,
@@ -386,10 +380,8 @@ impl Game {
         bidder_bid: Bid,
         trick_no: usize,
     ) -> Result<(), String> {
-        // Jokers can be played ANYTIME (even if player can follow suit or trump was led),
-        // but Red-before-Black has constraints.
+        // Jokers can be played ANYTIME, but Red-before-Black has constraints.
         if chosen.is_joker() {
-            // Red before Black: allowed only if bidder >= 7, bidder holds BOTH jokers, and within first 3 tricks
             if matches!(chosen.rank, Rank::RJoker) && !self.black_played {
                 if bidder_bid.value() >= 7
                     && self.players[bidder].has_black_joker()
@@ -398,10 +390,9 @@ impl Game {
                 {
                     return Ok(());
                 } else {
-                    return Err("Red Joker cannot be played before Black Joker unless the bidder (≥7) holds both jokers, and it must be within the first 3 tricks.".into());
+                    return Err("Red Joker cannot be played before Black Joker unless the bidder (≥7) holds both, within first 3 tricks.".into());
                 }
             }
-            // Black Joker can be played anytime
             return Ok(());
         }
 
@@ -427,7 +418,6 @@ impl Game {
                 && self.players[bidder].has_black_joker()
                 && self.players[bidder].has_red_joker()
                 && trick_no <= 3;
-            // If Red legitimately played before Black, then Black becomes leadable/highest trump (flag)
             if allow_exception && !self.black_played {
                 self.black_becomes_highest_trump = true;
             }
@@ -704,14 +694,19 @@ fn play_one_hand(game: &mut Game) {
     game.deck.mark_trump(trump);
     println!("\nTrump is {:?}.", trump);
 
-    /* ------------------ PLAY 9 TRICKS ------------------ */
+    /* ------------------ PLAY UP TO 9 TRICKS (with early end) ------------------ */
     // Leader is the player to the RIGHT (anticlockwise next) of the trump-chooser
     let mut leader = (bidder + 1) % game.num_players;
 
     let mut tricks_won = [0u8, 0u8];
     let mut black_played_by_round3 = false;
+    let bid_target = bid.value() as u8;
+    let bidder_team = game.team_of(bidder);
 
-    for trick_no in 1..=9 {
+    // early_end signals we stopped due to math certainty
+    let mut early_end = false;
+
+    for trick_no in 1usize..=9 {
         println!("\n=== Trick {}/9 ===", trick_no);
 
         let mut order = Vec::with_capacity(game.num_players);
@@ -731,6 +726,10 @@ fn play_one_hand(game: &mut Game) {
             let chosen = choose_card_from_hand(&game, p, lead_card.as_ref(), bidder, bid, trick_no);
             game.on_card_played(p, &chosen, bidder, bid, trick_no);
 
+            if game.black_played && trick_no <= 3 {
+                black_played_by_round3 = true; // mark as soon as Black is seen in first 3 tricks
+            }
+
             // Announce the play immediately so the next player sees it in the ground list
             println!("Player {} played {}", p, chosen.describe());
 
@@ -738,10 +737,6 @@ fn play_one_hand(game: &mut Game) {
                 lead_card = Some(chosen.clone());
             }
             plays.push((p, chosen));
-        }
-
-        if trick_no == 3 && game.black_played {
-            black_played_by_round3 = true;
         }
 
         // Decide winner of the trick
@@ -769,10 +764,40 @@ fn play_one_hand(game: &mut Game) {
             Game::team_name(winner_team),
             plays[win_idx].1.describe()
         );
+
         println!(
-            "Tricks so far — Team 0: {} | Team 1: {}",
-            tricks_won[0], tricks_won[1]
+            "[Round Status] Bid: {} ({} needs {}) | Tricks so far: Team0={} Team1={} | Tricks remaining: {}",
+            bid.label(),
+            Game::team_name(bidder_team),
+            bid_target,
+            tricks_won[0],
+            tricks_won[1],
+            9 - trick_no
         );
+
+        // Early end logic:
+        let remaining: u8 = (9 - trick_no) as u8;
+
+        // 1) Bidder already met the target
+        if tricks_won[bidder_team] >= bid_target {
+            println!(
+                "\n[Auto End] {} reached their bid of {} tricks and wins the hand early!",
+                Game::team_name(bidder_team),
+                bid_target
+            );
+            early_end = true;
+            break;
+        }
+        // 2) Bidder cannot reach target anymore (not enough tricks left)
+        if tricks_won[bidder_team] + remaining < bid_target {
+            println!(
+                "\n[Auto End] {} can no longer reach {} tricks. Opponents win the hand!",
+                Game::team_name(bidder_team),
+                bid_target
+            );
+            early_end = true;
+            break;
+        }
 
         // Next trick leader is the winner
         leader = winner_player;
@@ -780,11 +805,10 @@ fn play_one_hand(game: &mut Game) {
 
     /* ------------------ SCORING & PENALTIES ------------------ */
     let hand_winner_team = if tricks_won[0] > tricks_won[1] { 0 } else { 1 };
-    let bidder_team = game.team_of(bidder);
     let bidder_tricks = tricks_won[bidder_team];
     let x = bid.value();
 
-    // Penalty if Black Joker not played within first 3 tricks
+    // Penalty: Black Joker not played by end of trick 3
     if !black_played_by_round3 {
         game.scores[hand_winner_team] =
             game.scores[hand_winner_team].saturating_add(15);
@@ -806,8 +830,9 @@ fn play_one_hand(game: &mut Game) {
     }
 
     println!(
-        "\nFINAL TRICK TALLY — Team 0: {} | Team 1: {}",
-        tricks_won[0], tricks_won[1]
+        "\nFINAL TRICK TALLY — Team 0: {} | Team 1: {}{}",
+        tricks_won[0], tricks_won[1],
+        if early_end { "  (ended early)" } else { "" }
     );
     println!(
         "SCORES — Team 0: {} | Team 1: {}",

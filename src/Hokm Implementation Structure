@@ -1,0 +1,364 @@
+Step 1 — Workspace skeleton
+
+Create / Edit
+
+Root Cargo.toml: declare a workspace with members: "warq_core" and "warq_bevy".
+
+Crate folders: warq_core/, warq_bevy/.
+
+Syntax cues
+
+In root Cargo.toml, section [workspace] with members = [...].
+
+In warq_core/Cargo.toml: normal library crate; add deps: thiserror, rand.
+
+In warq_bevy/Cargo.toml: binary crate; add dep on bevy = "0.17" and path dep on warq_core.
+
+Behavior
+
+Nothing runs yet; just compiles.
+
+Tests you should write
+
+None yet.
+
+Done when
+
+cargo test -p warq_core compiles (0 tests OK).
+
+cargo run -p warq_bevy compiles (you can leave main empty for now).
+
+Step 2 — Cards & deck (in warq_core)
+
+Create / Edit
+
+File src/lib.rs: re-export a card module.
+
+File src/card.rs: define cards.
+
+Syntax cues
+
+Enums: Suit, Rank, CardKind.
+
+Derives: Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug (add Ord only where ordering is meaningful, e.g., Rank).
+
+Newtype: struct Card(pub u8); // 0..=53
+
+Derives: Copy, Clone, Eq, PartialEq, Hash, Debug.
+
+const CARD_INDEX: [CardKind; 54] — a compile-time array mapping id -> CardKind.
+
+Functions:
+
+fn new_deck() -> Vec<Card> — returns Card(0)..Card(53) in order.
+
+impl Card { fn kind(self) -> CardKind } — returns CARD_INDEX[self.0 as usize].
+
+fn is_joker(Card) -> bool.
+
+Behavior
+
+54-card deck: 52 standards + BJ (index 52) + RJ (index 53).
+
+Rank order inside a suit is 2 < … < A.
+
+Tests you should write
+
+“deck has 54, ids 0..53”.
+
+“kind() matches CARD_INDEX for each card”.
+
+“CARD_INDEX[52] is BJ, [53] is RJ”.
+
+“Rank ordering is 2 < … < Ace”.
+
+Done when
+
+All tests pass.
+
+Step 3 — Seats, teams, turn order (in warq_core)
+
+Create / Edit
+
+File src/table.rs; re-export from lib.rs.
+
+Syntax cues
+
+struct Seat(pub usize); (derive Copy, Clone, Eq, PartialEq, Hash, Debug).
+
+enum Team { A, B } (derive same).
+
+struct Seating { teams: Vec<Team> }.
+
+impl Seating with:
+
+fn new(players: usize) -> Self — players is 4 or 6; seating alternates A,B,A,B,… (seat index parity decides team).
+
+fn team_of(&self, Seat) -> Team.
+
+fn right_of(&self, Seat) -> Seat (anti-clockwise; “next” is + n-1 mod n).
+
+fn left_of(&self, Seat) -> Seat (clockwise; “next” is +1 mod n).
+
+fn opponents(t: Team) -> Team.
+
+Behavior
+
+Correct anti-clockwise rotation and team mapping for 4p and 6p.
+
+Tests you should write
+
+“Seat 0 is A, 1 is B (4p)”.
+
+“In 6p, right of 0 is 5; left of 5 is 0”.
+
+“opponents(A) == B and vice versa”.
+
+“new panics or errors if players not in {4,6}” (your choice).
+
+Done when
+
+All tests pass.
+
+Step 4 — Config, phases, and errors (in warq_core)
+
+Create / Edit
+
+File src/state.rs; re-export from lib.rs.
+
+Add an error type.
+
+Syntax cues
+
+enum MatchMode { BlitzRound, FirstTo54, BestOfThree }.
+
+struct GameConfig { players: usize, mode: MatchMode }.
+
+enum Phase { Setup, Dealing, Bidding, ChooseTrump, Play, Scoring }.
+
+Error type with thiserror:
+
+enum RuleError { InvalidPlayers, NotYourTurn, IllegalBid, NoTrump, IllegalCard, JokerLeadNotAllowed, RJBeforeBJ, WrongPhase, CannotDeclareBound, InvalidCallout }
+
+Derive Debug and annotate with #[derive(thiserror::Error)] and #[error("...")] messages.
+
+Behavior
+
+Pure data containers; no game logic yet.
+
+Tests you should write
+
+Construct GameConfig with 4 and 6; ensure fields set.
+
+Instantiate each Phase (just compile-time sanity).
+
+Done when
+
+Tests pass.
+
+Step 5 — Bidding scaffold (data only, then validation)
+
+(We’ll do logic after your Step 1–4 are done.)
+
+Create / Edit
+
+New file src/bidding.rs; re-export from lib.rs.
+
+You will later wire this into a Game struct.
+
+Syntax cues (data types)
+
+enum BidValue { Pass, Number(u8) } // 5..9 or Pass
+
+struct Bid { seat: Seat, value: BidValue }
+
+struct Contract { bidder: Seat, bid: u8, trump: Option<Suit>, bound_declared: bool }
+
+Syntax cues (APIs you will implement)
+
+fn allowed_bid_range_for(shuffler: Seat, who: Seat) -> (u8, u8)
+
+Return (5,9) for shuffler; otherwise (6,9).
+
+fn validate_bid(hands: &[Vec<Card>], seating: &Seating, who: Seat, value: u8) -> Result<u8, RuleError>
+Enforce:
+
+in-range per role,
+
+8 requires bidder holds ≥1 Joker,
+
+9 requires bidder’s team has both Jokers; if the team has exactly one Joker total → return Ok(8) (auto-downgrade),
+
+otherwise error.
+
+Later (Step 6) you’ll add: set hakem (winning bidder), compute leader_of_trick1 = right_of(bidder), and enter ChooseTrump.
+
+Behavior
+
+Only validates a single bid against prerequisites (we’ll add bid order/raising later).
+
+Tests you should write
+
+“shuffler can bid 5; others cannot”.
+
+“8 requires bidder has at least one Joker”.
+
+“9 requires both Jokers on bidder’s team; exactly one Joker on team ⇒ returns 8; zero ⇒ error”.
+
+Done when
+
+All tests pass with your own hand setups (manually craft minimal hands containing Jokers to hit each branch).
+
+Step 6 — Trump choice & trick #1 opening constraints
+
+Create / Edit
+
+Add a Game container struct (new file src/game.rs) to hold:
+
+cfg: GameConfig, seating: Seating, phase: Phase,
+
+shuffler: Seat, hands: Vec<Vec<Card>>,
+
+contract: Option<Contract>,
+
+leader_of_trick1: Option<Seat>, leader: Option<Seat>,
+
+bookkeeping for trick index and lead suit (you will fully flesh this out in Step 7).
+
+Syntax cues (APIs)
+
+fn choose_trump(&mut self, suit: Suit) -> Result<(), RuleError>
+
+Require phase ChooseTrump; set contract.trump = Some(suit); set phase = Play; set trick_index = 1; set leader = leader_of_trick1; clear lead_suit.
+
+Store a boolean like opening_constraint_active when bid >= 8 to enforce special rule on trick #1.
+
+Behavior
+
+After trump is chosen, the first leader is the seat to the right of the winning bidder.
+
+For bids 8 or 9, on trick #1:
+
+leader must lead trump if able;
+
+if not, the second player must play trump if able;
+
+otherwise, first card sets lead suit as normal.
+
+Tests you should write
+
+“after choose_trump, phase is Play, leader is right of bidder”.
+
+“with bid 8 or 9: if leader has trump and leads non-trump ⇒ reject”.
+
+“with bid 8 or 9: if leader lacks trump but second player has trump and plays non-trump ⇒ reject”.
+
+“if neither has trump, any card is allowed and first non-joker standard sets lead suit”.
+
+Done when
+
+Tests lock these rules.
+
+Step 7 — Play loop primitives (lead/follow, joker rules, trick winner)
+
+Create / Edit
+
+Add per-trick state: trick_index: u8 (1..=9), lead_suit: Option<Suit>, plays: Vec<(Seat, Card)>.
+
+Add joker tracking: a set or booleans bj_seen, rj_seen.
+
+Syntax cues (APIs)
+
+fn can_lead(&self, seat, card) -> Result<(), RuleError>
+
+Disallow Joker leads except during a “joker free-play window” (defined later).
+
+Disallow RJ lead before BJ has appeared.
+
+fn can_follow(&self, seat, card) -> Result<(), RuleError>
+
+If not in a free-play window, must follow lead suit if able.
+
+Enforce RJ before BJ rule for non-leaders, with the “both jokers in same hand” exception.
+
+Apply trick-1 opening constraint for the second player (from Step 6).
+
+fn play_card(&mut self, seat, card) -> Result<(), RuleError>
+
+Validate with can_*, set lead_suit when the first standard card is led, record jokers as “seen”, and when trick completes, resolve winner.
+
+Behavior
+
+Winner priority: RJ > BJ > highest trump > highest lead-suit; off-suit non-trump cannot win.
+
+When trick resolves: increment that team’s trick count; set next leader to the winner; clear per-trick state; increment trick_index.
+
+Tests you should write
+
+“RJ beats BJ; BJ beats any trump; trump beats lead-suit; lead-suit beats others”.
+
+“RJ cannot be played before BJ unless the player holds both jokers” (but still cannot lead outside window).
+
+“Trick resolution advances leader and trick index”.
+
+Done when
+
+All play tests pass.
+
+Step 8 — Joker windows, early end, Bound declaration, callouts, scoring
+
+Behavior to implement
+
+Joker free-play windows:
+
+True on: Bid = 9 (tricks 7–9), or Bid = 7 and Bound declared (tricks 7–9).
+
+In these windows: jokers may be played on any card, ignoring follow-suit; BJ may lead; RJ may lead only after BJ has appeared.
+
+Early end of hand:
+
+Success early if bidder’s team tricks >= BID.
+
+Fail early if defenders’ tricks > 9 - BID.
+
+Bound (only for Bid=7):
+
+After trick 6, if bidder’s team is 6–0, bidder may declare Bound; flips the joker window on for 7–9.
+
+Callouts (illegal cut / not following suit):
+
+Can be made only after trick 1 has finished; can only target a completed trick.
+
+No violations during joker windows.
+
+Scoring for a correct/false call:
+
+Low contracts (5–8): ±15, hand does not end.
+
+High contracts (Bound(7) or 9): ±36, hand ends immediately.
+
+Scoring summary:
+
+Normal success: +BID to bidding team.
+
+Normal fail (6–8): +2×BID to defenders.
+
+Malzoom fail (bid 5 by shuffler): +5 to defenders; success: +5 to bidding team.
+
+Bid 9 success/fail: +36 to winner/defenders.
+
+Bound success/fail: +36 / +18.
+
+Tests you should write
+
+Window logic flips correctly for (9) and (7 with Bound).
+
+Early end triggers at the correct thresholds.
+
+Callout rewards/penalties and “ends hand” behavior match tables.
+
+Scoring deltas match the summary for representative scenarios.
+
+Done when
+
+All tests encode the rule tables and pass.
